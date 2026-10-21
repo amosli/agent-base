@@ -17,6 +17,7 @@
 | 07 | [内部培训大纲：AgentScope 深入原理](07-内部培训大纲-AgentScope深入原理.md) | 6 小时团队培训课程：8 个模块「Demo → 现象 → 提问 → 原理 → 源码 → 实验 → 小结」，含讲师手册、三种裁剪方案（6h 目标 / 4.5h 保底）、Demo 脚本清单 | 要做团队培训时 |
 | 08 | [调试与实战手册](08-调试与实战手册.md) | 三层调试法（事件流/中间件/断点回放）、事件序列对照表、确定性回放、Prompt 调试、Token 计量、常见问题 Symptom→原因→定位 | **开发与排障时随时查** |
 | 09 | [持久层选型：MyBatis 还是 Hibernate](09-持久层选型-MyBatis-vs-Hibernate.md) | 框架自身双轨制事实（状态层纯 JDBC + 平台层 JPA，零 MyBatis）、12 维对比、**两张架构图（MyBatis 方案 / JPA 方案）**、决策树、WebFlux 阻塞坑、混合策略、archify 使用说明 | 做 Java 版持久层选型时 |
+| 10 | [保险理赔智能体 Demo（insurance-agent）](10-insurance-agent-保险理赔Demo.md) | 场景建模、**四张架构图**（总体/主流程/事件序列/HITL 时序）、工具与权限设计、停泊-恢复实现、与 FinXScope 能力对照、运行演示 | 要看"原理如何落到代码"时 |
 
 **建议阅读顺序**：时间紧 → `06` → `03` → 按需 `01`/`02`；要深究 → `01` → `02` → `03` → `04` → `05` → `06`。
 **开发排障**：直接查 `08`（比读原理快得多）；**培训**：以 `07` 为纲，`08` 作实验素材。
@@ -32,6 +33,7 @@
 7. **选型一句话**：基座选 AgentScope（Java 优先）；编排用其原生能力，不引入第二个运行时；检索短板用外部检索层补齐；金融场景照 FinXScope 六层架构做三级权限、全链路审计与可观测。
 8. **调试先看事件流，别先打断点**：事件序列是 Agent 的"栈追踪"，正常序列固定、偏离即异常（对照表见 [08 §2.3](08-调试与实战手册.md)）。
 9. **持久层选型（Java 版）**：AgentScope Java 自身**不用 MyBatis**，而是"热点路径纯 JDBC（`extensions-jdbc` + 方言层）+ 外围 CRUD 用 JPA（service 层 20+ Repository）"。业务层照此分层抄：**实体 CRUD 用 JPA、复杂查询/报表/pgvector 用 MyBatis**，两者共用 DataSource 与事务管理器。Agent 运行时状态由框架 `DistributedStore` 管理，**不需要你选 ORM**（详见 [09](09-持久层选型-MyBatis-vs-Hibernate.md)）。
+10. **insurance-agent demo**（`agent_base/insurance-agent/`，已编译通过）：保险理赔全流程，演示 ReAct 循环 / 工具 / 三态权限 / **HITL 停泊-恢复** / 结构化输出五个机制；9 个工具（6 读 ALLOW + 3 写 ASK），HITL 恢复走 `Msg.METADATA_CONFIRM_RESULTS`（详见 [10](10-insurance-agent-保险理赔Demo.md)）。
 
 ## 术语表（跨文档统一口径）
 
