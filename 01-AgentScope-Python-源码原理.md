@@ -1,7 +1,16 @@
 # 01 · AgentScope Python 版源码原理
 
-> 源码路径：`agent_base/agentscope`（版本 `2.0.11dev`，见 `src/agentscope/_version.py:4`）。
-> 本文所有行号均基于该版本，路径前缀统一省略为 `src/agentscope/`。
+> **TL;DR（3 分钟版）**
+> - 2.x 是彻底重构：1.x 的 `AgentBase`/`ReActAgent`/`UserAgent`、`memory`、`session`、`tracing`、`evaluate`、`MsgHub` **全部不存在或改名**（§0 有对照表，先看它，否则读代码会对不上号）。
+> - 核心只有三样：**单个 `Agent` 类**（行为差异全走 4 个配置对象）+ **纯函数状态机 `_next_action`**（Reasoning/Acting/Exit 三态）+ **7 钩子中间件**（长期记忆、RAG、Tracing 全是中间件，核心类零改动）。
+> - 灵魂设计是**停泊-恢复**：`reply_stream` 的入参可以是"确认结果/外部执行结果/打断事件/None"，一次 reply 跨多次调用，靠 `reply_id` 路由——这是 HITL、跨进程恢复、跨天任务的基础。
+> - 面向"LLM 会犯错"做了大量防御（容错 JSON 解析、结构化输出四策略降级、空流保护、压缩渐进截断），是这套代码最值得学的工程品味。
+> - **短板**：无持久化事件域（无 fork / 投影式压缩 / 逐字节重建校验）；async-only；无 evaluate 模块。
+
+> 源码路径：`agent_base/agentscope`
+> **行号基线**：版本 `2.0.11dev`（`src/agentscope/_version.py:4`），`main` 分支 **commit `402c3664`**（2026-10-19）。
+> 本文所有行号基于该 commit，路径前缀统一省略为 `src/agentscope/`。
+> **如何验证本文结论**：`cd agent_base/agentscope && git checkout 402c3664`，然后用 `sed -n '<行号>p' <文件>` 逐条核对；升级后行号会漂移，请以本文给出的"类名/方法名"为锚重新定位。
 > 姊妹篇：[02-AgentScope-Java-源码原理](02-AgentScope-Java-源码原理.md)
 
 ## 0. 阅读须知：先纠偏 1.x 概念
@@ -39,7 +48,7 @@ src/agentscope/（30 个顶层包）
 │  └─ types/       ReplyFinishedReason · ErrorInfo · JSONSerializableObject
 ├─ 能力层
 │  ├─ model/       ChatModelBase + 12 个厂商实现
-│  ├─ formatter/   FormatterBase + 每厂商 ×(Chat / MultiAgent) 两套，共 24 个类
+│  ├─ formatter/   FormatterBase + 12 厂商各一套 Chat/MultiAgent（13 个模块、约 30 个类）
 │  ├─ tool/        Toolkit · ToolBase · FunctionTool/MCPTool · _builtin/ · _task/
 │  ├─ rag/         KnowledgeBase + _parser/ + _chunker/ + _vdb/
 │  ├─ embedding/   EmbeddingModelBase + 4 厂商 + FileEmbeddingCache
@@ -326,7 +335,7 @@ SDK provider 级 → `ChatModelBase.__call__` → `Agent._call_model`（`_agent.
 - `convert_tool_result_to_string`（`:105-187`）：**把多模态工具结果降级为文本**，用 block 自身 id 作标识符（保证重复格式化结果稳定、prompt cache 友好）；不支持的写成 `<<<TRUNCATED>>>` 式提醒。
 - `_group_messages`（`:189-232`）：把消息流切成 `tool_sequence` / `agent_message` 两组——这是 Chat 与 MultiAgent 两种 formatter 分化的基础。
 
-24 个具体实现（每厂商 × Chat/MultiAgent）。以 OpenAI 为例：`OpenAIMultiAgentFormatter`（`_openai_formatter.py:427`）把多个 agent 的消息**折叠成一段 `<history>` 文本**（`f"{msg.name}: {block.text}"`，`:520`），工具序列仍委托 `OpenAIChatFormatter`。
+12 个厂商各一套 Chat/MultiAgent 两套（另有 OpenAI Response 变体与各厂商的 Converter/Merger 辅助类，`formatter/` 下共 13 个模块、约 30 个类）。以 OpenAI 为例：`OpenAIMultiAgentFormatter`（`_openai_formatter.py:427`）把多个 agent 的消息**折叠成一段 `<history>` 文本**（`f"{msg.name}: {block.text}"`，`:520`），工具序列仍委托 `OpenAIChatFormatter`。
 
 ---
 

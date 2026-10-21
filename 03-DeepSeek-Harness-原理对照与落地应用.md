@@ -1,6 +1,13 @@
 # 03 · DeepSeek Harness 原理对照与在 AgentScope 中的落地应用
 
-> 参照物：`dsh/`（DeepSeek Harness，`@deepseek-ai/dsh`）的 01~10 原理文档与源码分析。
+> **TL;DR（3 分钟版）**
+> - 本文回答一个问题：**dsh（DeepSeek Harness）被验证过的工程思想，哪些能搬到 AgentScope、怎么搬**。
+> - dsh 最值得学的是**三条纪律**：① 日志即状态（fork/resume/审计/回放变成结构性免费能力）；② 扩展点显式权力分级（emit 不能否决 / serial 可否决 / waterfall 可改写）；③ 失败一律塌缩为结构化结果而非中止轮次。
+> - 落地结论：**Java 版以 `agentscope-harness` 为基座**，只需补"模型历史从日志投影"+"工具三段流水线"两件事；**Python 版用中间件自建持久化事件域**，其余同理。**两者都不需要 fork 核心代码**。
+> - **三个不要照搬**：Cordis 可逆效果体系、PTC（`run_code`）、100% 覆盖率门禁——理由见 §3.4。
+> - 本文的映射总表（§3.1）与四阶段路径（§3.2）可直接当落地 Checklist 用。
+
+> 参照物：`dsh/`（DeepSeek Harness，`@deepseek-ai/dsh`）的 01~10 原理文档与源码分析（引用 `dsh/01 §13` 等章节号指本仓库内文档）。
 > 目标：把 dsh 被验证过的工程思想，映射到 AgentScope Python / Java 上，给出可执行的落地路径。
 > 前置：[01-AgentScope-Python-源码原理](01-AgentScope-Python-源码原理.md)、[02-AgentScope-Java-源码原理](02-AgentScope-Java-源码原理.md)
 

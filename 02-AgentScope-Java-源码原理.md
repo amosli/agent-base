@@ -1,7 +1,16 @@
 # 02 · AgentScope Java 版源码原理
 
-> 源码路径：`agent_base/agentscope-java`（`2.1.0-SNAPSHOT`，GA 发布版本 2.0.3；JDK 17+）。
+> **TL;DR（3 分钟版）**
+> - Java 版不是 Python 的移植，而是**面向生产环境的重新定位**：`core`（ReAct 内核）→ `harness`（生产运行时）→ `service`（Agent-as-a-Service 四平面）三层，单向依赖，core 不反向依赖任何上层。
+> - `HarnessAgent` **组合而非继承** `ReActAgent delegate`，核心推理循环原样保留，20 个中间件各管一摊（workspace/沙箱/子 agent/技能/记忆/计划模式）。
+> - **两个世界级设计**：① **双事件系统**——32 类 `AgentEvent`（给前端/HITL）与 57 类 `SessionLog`（持久化，带租约 + epoch + fencing + CAS commit + 独立 inbox）分离，后者是面向多副本的写入者选举；② **完全无状态 + 显式多租户**——per-call 状态走 Reactor Context 透传而非字段，同一实例可并发服务多 session。
+> - **选型前必须知道的两个短板**：**RAG 与长期记忆 v2 处于空窗期**（core 里 v1 全部 `@Deprecated(forRemoval)`，实现在 extensions 且推进中）；**Pipeline/MsgHub/Fanout 已删除**（`change-log.md:42`），编排要走子 agent + 团队。
+> - **Java 版相对 Python 领先**：事件溯源、沙箱矩阵、分布式存储、四平面平台、A2A/AG-UI、13 个 Spring Boot starter、Bash 的 AST 级安全分析。
+
+> 源码路径：`agent_base/agentscope-java`
+> **行号基线**：`2.1.0-SNAPSHOT`（GA 发布版本 2.0.3；JDK 17+），`main` 分支 **commit `2c6d0eb0`**（2026-10-19）。
 > 路径前缀约定：`agentscope-core/...` = `agentscope-core/src/main/java/io/agentscope/core/...`；`harness/...` = `agentscope-harness/src/main/java/io/agentscope/harness/...`。
+> **如何验证本文结论**：`cd agent_base/agentscope-java && git checkout 2c6d0eb0`，用 `sed -n '<行号>p' <文件>` 逐条核对；升级后行号会漂移，请以"类名/方法名"为锚重新定位。
 > 姊妹篇：[01-AgentScope-Python-源码原理](01-AgentScope-Python-源码原理.md)
 
 ## 0. 一句话定性
@@ -209,6 +218,40 @@ DashScope 实现含 `DashScopeChatFormatter` / `DashScopeMultiAgentFormatter` / 
 - `CompactionMiddleware`（`harness/agent/middleware/CompactionMiddleware.java:65`）：`onReasoning` 阶段触发。流程：flush 长期记忆 → **原生 session log 保留完整对话** → LLM 蒸馏前缀 → 替换 `AgentState.context` → 重建 `ReasoningInput`。动态阈值 = `model.getContextWindowSize() - reserved`，模型不报窗口则回退 `FALLBACK_TRIGGER_TOKENS`。另有 `overflowRecovery()` 在同一执行内重试上下文溢出。
 - `ToolResultEvictionMiddleware`：>80K 字符的工具结果落盘 + 占位符。
 
+### 5.5 RAG 与知识库：空窗期现状与三条实战路线
+
+**先说现状（选型前必读）**：core 的 `rag/` 包整体废弃——`Knowledge.java:30-33` 的 javadoc 原话是 *"The rag package is removed; integrate retrieval at the application layer"*，并标注 `@Deprecated(forRemoval = true, since = "2.0.0")`。`change-log.md:238-242` 明确"v2 架构下的 knowledge base / document reader / store 将在后续 minor 版本上线；**新代码先不要依赖**"。
+
+也就是说：**Java 版目前没有官方的 v2 RAG 抽象**，需要应用层自己解决。可用资产在扩展模块里（注意包名仍是 `io.agentscope.core.*`，物理位置在 `agentscope-extensions/`）：
+
+| 组件 | 位置 | 说明 |
+|---|---|---|
+| Embedding | `agentscope-extensions-rag/agentscope-extensions-rag-simple/.../core/embedding/` | `EmbeddingModel` 接口 + DashScope/OpenAI/Ollama 文本嵌入 + DashScope 多模态嵌入 |
+| Reader | 同模块 `.../core/rag/reader/` | `TextReader` / `PDFReader` / `WordReader`(21.65KB) / `TikaReader` / `ImageReader` / `ExternalApiReader` + `TextChunker` |
+| Vector Store | 同模块 `.../core/rag/store/` | `InMemoryStore` / **`QdrantStore`(41.73KB)** / **`PgVectorStore`(39.56KB)** / `MilvusStore` / `ElasticsearchStore` |
+| Knowledge | 同模块 `.../core/rag/knowledge/SimpleKnowledge.java` | 薄封装 |
+| 其他 RAG 集成 | `-rag-bailian`（阿里云百炼）/ `-rag-dify` / `-rag-ragflow` / `-rag-haystack` | 外部 RAG 平台适配 |
+| 评估/记忆扩展 | `-mem-{mem0,reme,bailian}` | 长期记忆 |
+
+**三条实战路线（按推荐度排序）**：
+
+**路线 A：pgvector 自建（最可控，推荐给有 PG 的团队）**
+用 `PgVectorStore` + 自建文档接入。优点：无额外组件（金融机构普遍已有 PostgreSQL）、SQL 可审计、可与业务表 join。要点：建表时设好 `vector(dim)` 维度（与 embedding 模型一致，换模型要重建索引）、索引用 `ivfflat`/`hnsw`、按租户加 `metadata` 列做隔离。
+
+**路线 B：百炼/RAGFlow/Dify 外挂（最快）**
+用 `-rag-bailian` / `-rag-ragflow` / `-rag-dify` 直接接已有平台，把检索封装成一个**工具**（`@Tool`）或 MCP server 暴露给 Agent。优点：开箱即用、平台自带解析与重排；缺点：多一个外部依赖、链路穿透性差（检索细节不在 SessionLog 里，审计要单独接）。
+
+**路线 C：等 v2（不推荐作为当前项目依赖）**
+官方 roadmap 明确"后续 minor 版本上线"。若现在按 v2 API 设计代码，等于赌发布时间。
+
+**共同注意点（三条路线都适用）**：
+1. **检索必须做成工具或 MCP，而不是把结果硬塞进上下文**——否则每次请求都检索，token 成本与噪声双高。参考 Python 版 `RAGMiddleware` 的两种模式（agentic 让模型自己决定何时检索 / static 每轮注入），Java 版需自建等价中间件。
+2. **权限透传**：检索接口必须带上调用者身份，让知识召回自动继承用户权限边界（金融硬需求，见 [05 §4.7](05-FinXScope-金融级智能体底座深度研究.md)）。
+3. **审计**：检索命中的文档、chunk、分数要进 SessionLog，否则"回答依据"不可追溯。
+4. **评估缺失**：Java 版无 evaluate 模块（与 Python 版同样缺失），检索质量需自建评测集（FinXScope 的做法是 FinXVantage 全链路评测平台，见 [05](05-FinXScope-金融级智能体底座深度研究.md)）。
+
+> **结论**：Java 版 RAG 的现状是"能拼起来，但没有官方抽象"。**有 PG 就走路线 A，要快就走路线 B**；无论哪条，都建议把检索封装成工具并在 SessionLog 留痕。
+
 ---
 
 ## 6. 多智能体编排
@@ -353,6 +396,33 @@ inbox()                                                        // :24-27   持�
 - **优雅停机**：`shutdown/`（`GracefulShutdownManager`、`GracefulShutdownMiddleware`、`PartialReasoningPolicy`）；停机中断后重试自动去重输入。
 - **Bash 安全**：tree-sitter-bash 做 **AST 级命令安全分析**。
 - **测试**：JUnit 5（6.0.2）+ Mockito + **reactor-test StepVerifier** + testcontainers；core 发布 test-jar 供 harness 复用 `MockModel` / `MockToolkit`；JaCoCo 覆盖率。
+
+### 10.1 并发模型与容量（生产准入必答）
+
+这是源码里看不出来、但压测一定会问的一组问题。基于源码事实整理：
+
+| 问题 | 源码事实 | 容量含义 |
+|---|---|---|
+| **单会话并发如何串行化** | `AgentBase.java:113-119` 的 `callGates`：同一 `(userId, sessionId)` 的调用 FIFO 串行，不同 session 并发 | **同一会话的第二条消息必须排队**，不会并发改写同一 `AgentState`。容量模型 = 活跃 session 数，不是用户数 |
+| **阻塞操作在哪里跑** | 默认 `Schedulers.boundedElastic()`（`ToolExecutor.java:566`）；`SessionLog` 显式 `subscribeOn(boundedElastic)`（`HarnessContextBuilder.java:153`） | boundedElastic 默认线程数 = `CPU × 10`，上限 100 000 队列。**工具执行与日志写入共享这个池**——工具慢会挤压日志写入，需监控队列深度 |
+| **工具并发的实际上限** | `ToolkitConfig.parallel = true`（`:127`），默认超时 5 分钟、1 次尝试；可注入自定义 `ExecutorService`（`:153-156`） | 单次 `acting` 的工具并发度 = 该批 `concurrencySafe` 工具数。**要限流就注入自己的线程池**，不要用默认 |
+| **模型流式响应的背压** | `Flux<ChatResponse>` 全链路，保留 `doOnCancel` | 前端消费慢会向上游传导取消；SSE 场景要注意客户端断开即取消整条链 |
+| **SessionLog 写入开销** | 阻塞式持久化 SPI，runtime 负责调度到 boundedElastic | 每次事件都落盘（Redis/DB）。**事件量大时这是吞吐瓶颈**，需要批量/异步策略（`SessionRecorder` 已 26KB，需确认是否批量） |
+| **压缩的额外模型调用** | `CompactionMiddleware` 在 `onReasoning` 触发，要再调一次 LLM 蒸馏 | 压缩本身消耗一次模型调用 + token。触发太频繁 = 成本翻倍；`trigger_ratio` 要按业务调 |
+| **状态 CAS 冲突** | `saveIfVersion` + `ConflictPolicy`，`stateConflictCount` 计数器 | 多副本同会话路由错实例会冲突。**容量规划前先确认会话亲和性**（同 session 固定路由） |
+
+**压测与容量规划建议**：
+
+1. **指标优先于压测**：先接好 `stateConflictCount`、boundedElastic 队列深度、SessionLog 写入 P99、压缩触发频率四个指标，再决定压测目标。
+2. **基准模型**：以"每会话消息数 × 平均工具调用数 × 平均工具耗时"估算单会话占用时长；再按目标 QPS 反推所需 session 并发数与线程池大小。
+3. **成本模型**：一次完整 turn 的 token = 系统提示 + 上下文 + 工具 schema + 工具结果；**压缩会额外产生一次摘要调用**。把这两个数做成仪表盘（FinXScope 的六层指标即按此设计，见 [05 §7.4](05-FinXScope-金融级智能体底座深度研究.md)）。
+4. **常见误区**：用"用户数"估容量——实际应该用"**活跃会话数 × 平均会话时长**"；用默认线程池不限流——工具慢会拖垮日志写入与后续请求。
+
+> 这一节是**基于源码的推断性整理**（线程池默认值、池共享关系来自源码与 Reactor 默认语义，未做实测压测）。上线前请以实际压测数据校准。
+
+---
+
+## 11. 与 Python 版特性对比矩阵
 
 ---
 
